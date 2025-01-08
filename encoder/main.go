@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 
 	"github.com/google/uuid"
+	"pack/db"
+	"pack/model"
 )
 
 // 加载图片
@@ -40,10 +42,14 @@ func saveImage(img image.Image, outputPath string) error {
 }
 
 // 拼接图片（按等宽或等高）
-func concatImages(images []image.Image, isVertical bool) image.Image {
+func concatImages(images []model.ImageDetail, isVertical bool, name string, db *db.SqlLiteDB) image.Image {
+	detail := new(model.ConcatImageDetail)
+	detail.OutPutName = name
+	detail.Records = make([]model.ImageInfo, 0)
+
 	var totalWidth, totalHeight int
 	for _, img := range images {
-		bounds := img.Bounds()
+		bounds := img.Img.Bounds()
 		if isVertical {
 			totalWidth = bounds.Dx()
 			totalHeight += bounds.Dy()
@@ -56,26 +62,46 @@ func concatImages(images []image.Image, isVertical bool) image.Image {
 	dst := image.NewRGBA(image.Rect(0, 0, totalWidth, totalHeight))
 	offset := 0
 	for _, img := range images {
-		bounds := img.Bounds()
+		bounds := img.Img.Bounds()
 		if isVertical {
 			rect := image.Rect(0, offset, bounds.Dx(), offset+bounds.Dy())
-			draw.Draw(dst, rect, img, image.Point{}, draw.Over)
+			draw.Draw(dst, rect, img.Img, image.Point{}, draw.Over)
+			g := model.ImageInfo{
+				Name:    img.FileName,
+				OffsetX: 0,
+				OffsetY: offset,
+				X:       bounds.Dx(),
+				Y:       offset + bounds.Dy(),
+			}
+			detail.Records = append(detail.Records, g)
 			offset += bounds.Dy()
 		} else {
 			rect := image.Rect(offset, 0, offset+bounds.Dx(), bounds.Dy())
-			draw.Draw(dst, rect, img, image.Point{}, draw.Over)
+			draw.Draw(dst, rect, img.Img, image.Point{}, draw.Over)
+			g := model.ImageInfo{
+				Name:    img.FileName,
+				OffsetX: offset,
+				OffsetY: 0,
+				X:       offset + bounds.Dx(),
+				Y:       bounds.Dy(),
+			}
+			detail.Records = append(detail.Records, g)
 			offset += bounds.Dx()
 		}
+	}
+	err := db.InsertDetail(detail)
+	if err != nil {
+		log.Printf("Insert detail err: %v", err)
 	}
 	return dst
 }
 
 // 获取图片分组（按等宽优先）
-func groupImagesByDimensions(imagePaths []string) ([][]image.Image, error) {
-	widthGroups := make(map[int][]image.Image)
-	heightGroups := make(map[int][]image.Image)
+func groupImagesByDimensions(imagePaths []string) ([][]model.ImageDetail, error) {
+	widthGroups := make(map[int][]model.ImageDetail)
+	heightGroups := make(map[int][]model.ImageDetail)
 	processed := make(map[string]bool)
-	var groups [][]image.Image
+	var groups [][]model.ImageDetail
 
 	for _, path := range imagePaths {
 		img, err := loadImage(path)
@@ -87,7 +113,7 @@ func groupImagesByDimensions(imagePaths []string) ([][]image.Image, error) {
 
 		// 按宽分组
 		if !processed[path] {
-			widthGroups[width] = append(widthGroups[width], img)
+			widthGroups[width] = append(widthGroups[width], model.ImageDetail{FileName: path, Img: img})
 			processed[path] = true
 		}
 	}
@@ -108,7 +134,7 @@ func groupImagesByDimensions(imagePaths []string) ([][]image.Image, error) {
 			}
 			bounds := img.Bounds()
 			height := bounds.Dy()
-			heightGroups[height] = append(heightGroups[height], img)
+			heightGroups[height] = append(heightGroups[height], model.ImageDetail{FileName: path, Img: img})
 			processed[path] = true
 		}
 	}
@@ -126,7 +152,7 @@ func groupImagesByDimensions(imagePaths []string) ([][]image.Image, error) {
 			if err != nil {
 				return nil, err
 			}
-			groups = append(groups, []image.Image{img})
+			groups = append(groups, []model.ImageDetail{{FileName: path, Img: img}})
 		}
 	}
 	return groups, nil
@@ -135,8 +161,9 @@ func groupImagesByDimensions(imagePaths []string) ([][]image.Image, error) {
 func main() {
 	inputDir := "." // 当前目录
 	outputDir := "output"
-
+	dbPath := `../data.db`
 	// 遍历目录获取所有 JPG 文件路径
+	dataSource := db.NewSqlLiteDB(dbPath)
 	var imagePaths []string
 	err := filepath.WalkDir(inputDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -159,16 +186,6 @@ func main() {
 
 	// 每 6 张图片拼接成一张长图
 	for _, group := range groups {
-		// 长宽分组都拼不齐的直接输出原图
-		if len(group) == 1 {
-			filename := filepath.Join(outputDir, fmt.Sprintf("%s.jpg", uuid.New().String()))
-			err = saveImage(group[0], filename)
-			if err != nil {
-				log.Fatalf("保存图片失败: %v", err)
-			}
-			fmt.Printf("图片已保存: %s\n", filename)
-			continue
-		}
 		for i := 0; i < len(group); i += 6 {
 			end := i + 6
 			if end > len(group) {
@@ -176,12 +193,10 @@ func main() {
 			}
 			subset := group[i:end]
 			// 检测拼接方向（等宽为垂直拼接，等高为水平拼接）
-			isVertical := group[0].Bounds().Dx() == subset[0].Bounds().Dx()
-			// 拼接图片
-			concatImg := concatImages(subset, isVertical)
-			// 随机生成文件名
-			filename := filepath.Join(outputDir, fmt.Sprintf("%s.jpg", uuid.New().String()))
-			// 保存拼接图片
+			isVertical := subset[len(subset)-1].Img.Bounds().Dx() == subset[0].Img.Bounds().Dx()
+			fileName := uuid.New().String()
+			concatImg := concatImages(subset, isVertical, fileName, dataSource)
+			filename := filepath.Join(outputDir, fmt.Sprintf("%s.jpg", fileName))
 			err = saveImage(concatImg, filename)
 			if err != nil {
 				log.Fatalf("保存图片失败: %v", err)
